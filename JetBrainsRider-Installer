@@ -1,0 +1,417 @@
+#!/usr/bin/bash
+
+# JetBrains Rider install script
+# Author: dungleanh297
+# Comments: This is the first time I write this long of bash script, so it could a little bit messy. Hope you like it. :-)
+# First written in 9 November 2026
+
+declare -g JRE_DIR="${JRE_DIR:-'/usr/lib/jvm/java-21-openjdk-amd64'}"
+declare -g DOTNET_DIR="${DOTNET_DIR:-'/usr/lib/dotnet'}"
+declare -g -i REMOVE_TEMP_FILE=${REMOVE_TEMP_FILE:-1}
+declare -g TEMP_DIR_PREFIX="${TEMP_DIR_PREFIX:-'/tmp/jetbrains-installer'}"
+
+declare -g INSTALL_FILE TEMP_DIR ARCHIVE_FILE_LIST ARCHIVE_JRE_UNIQUE_FILES COMMON_JRE_FILES \
+ARCHIVE_FOLDER_ROOT PLUGIN_INFO_FILE
+
+function check_dependencies()
+{
+    local -i SHOULD_EXIT=0
+
+    type -p xmllint > /dev/null 2> /dev/null
+    if [ $? -ne 0 ]; then
+        echo "[ERROR] This script requires xmllint to work. You can get it by installing libxml2-utils package." >&2
+        SHOULD_EXIT=1
+    fi
+
+    if [ $SHOULD_EXIT -ne 0 ]; then
+        exit 1
+    fi
+}
+
+# Initialize files that required for installation
+function initialize_information()
+{
+    local INSTALL_FILE="$1"
+
+    if [ -z "$INSTALL_FILE" ]; then
+        echo "[ERROR] Missing arugment" >&2
+        echo "        Usage:" >&2
+        echo "            initialize_information <install_archive_file>" >&2
+        exit 1
+    fi
+    
+    if [ ! -f "$INSTALL_FILE" ]; then
+        echo "[ERROR] Install file doesn't exist: $INSTALL_FILE"
+        exit 1
+    fi
+
+    echo "[INFO] Checking lock file..."
+    local LOCK_FILE="$TEMP_DIR_BASE/.lock"
+
+    if [ -f "$LOCK_FILE" ]; then
+        local PID_LOCK_FILE="$(cat "$LOCK_FILE")"
+        if [[ -n "$PID_LOCK_FILE" && -d "/proc/${PID_LOCK_FILE}/" ]]; then
+            echo '[ERROR]: This script is also running in another process. Unable to continue.'
+            exit 1
+        fi
+    fi
+
+    echo -n "$$" > "$LOCK_FILE"
+
+    ARCHIVE_FILE_LIST="${TEMP_DIR_BASE}/install-file-list.txt"
+
+    # Get archive's file list . This process takes a long time to finish, so we should save it for reusing later.
+    if [ ! -f "$ARCHIVE_FILE_LIST" ]; then
+        echo '[INFO] Initializing archive file list. This should take a while...'
+
+        tar -tf "$INSTALL_FILE" | sort | uniq > "${ARCHIVE_FILE_LIST}.swap" && mv "${ARCHIVE_FILE_LIST}.swap" "${ARCHIVE_FILE_LIST}"
+        if [ $? -ne 0 ]; then
+            echo "[ERROR] Unable to get information about archive file. The file may be corrupted or doesn't have sufficient permission to access." >&2
+            exit 1
+        fi
+    fi
+
+    ARCHIVE_FOLDER_ROOT="$(head -n 1 "$ARCHIVE_FILE_LIST")"
+
+    grep -M 1 "${ARCHIVE_FOLDER_ROOT}/bin/rider" "$ARCHIVE_FILE_LIST" > /dev/null 2> /dev/null
+    if [ $? -ne 0 ]; then
+        echo "[ERROR] This doesn't looks like a JetBrains Rider installation archive" >&2
+        exit 1
+    fi
+
+    local ARCHIVE_JRE_ROOT="${ARCHIVE_FOLDER_ROOT}jbr/"
+    local SYSTEMWIDE_JRE_FILES="${TEMP_DIR_BASE}/system-wide-jre-files.tmp"
+    local ARCHIVE_JRE_FILES="${TEMP_DIR_BASE}/jetbrains-jre-files.tmp"
+    local ARCHIVE_JRE_UNIQUE_FILES="${TEMP_DIR_BASE}/jetbrains-jre-unique-files.txt"
+    local COMMON_JRE_FILES="${TEMP_DIR_BASE}/common-jre-files.txt"
+
+    # Get common JRE's that pre-installed in the machine
+    if [[ ! -f "$ARCHIVE_JRE_UNIQUE_FILES" || ! -f "$COMMON_JRE_FILES" ]]; then
+        find "$JRE_DIR" -xtype f | cut "-c$(( ${#JRE_DIR} + 1 ))-" | sort > "$SYSTEMWIDE_JRE_FILES"
+        if [ $? -ne 0 ]; then
+            echo "[ERROR] Unable to get JRE's file list. Maybe it isn't installed yet. You could also want to change the JRE_DIR variable in this script." >&2
+            exit 1
+        fi
+
+        grep "$ARCHIVE_JRE_ROOT" "$ARCHIVE_FILE_LIST" | cut "-c$(( ${#ARCHIVE_JRE_ROOT} + 1 ))-" | grep -v -E '/$' > "$ARCHIVE_JRE_FILES"
+        comm -12 "$SYSTEMWIDE_JRE_FILES" "$ARCHIVE_JRE_FILES" > "${COMMON_JRE_FILES}.swap" && mv "${COMMON_JRE_FILES}.swap" "$COMMON_JRE_FILES"
+        comm -13 "$SYSTEMWIDE_JRE_FILES" "$ARCHIVE_JRE_FILES" > "${ARCHIVE_JRE_UNIQUE_FILES}.swap" && mv "${ARCHIVE_JRE_UNIQUE_FILES}.swap" "$ARCHIVE_JRE_UNIQUE_FILES"
+   fi
+
+    # Get all the plugin information
+    local ALL_PLUGIN_FILES="${TEMP_DIR_BASE}/all-plugin-files.tmp"
+    local PLUGIN_FOLDER_NAMES="${TEMP_DIR_BASE}/plugin-folder-names.tmp"
+    local PLUGIN_FILES_NEED_TO_EXTRACT="${TEMP_DIR_BASE}/plugin-files-need-to-extract.tmp"
+    local PLUGIN_INFO_FILE="${TEMP_DIR_BASE}/plugin-info.txt"
+    local PLUGIN_EXTRACT_DIR="${TEMP_DIR}/plugins-extract-dir"
+
+    if [ ! -f "$PLUGIN_INFO_FILE" ]; then
+        # Filter the plugin files inside the installation archive
+        # TODO: Escape the archive root path before put it into regular expression
+        grep -E "${ARCHIVE_ROOT}/[a-zA-Z0-9\-]+/lib/[A-Za-z0-9\-]+\.jar" "$ARCHIVE_FILE_LIST" > "$ALL_PLUGIN_FILES"
+
+        filter_plugin_files "${ARCHIVE_ROOT}plugins/" "$ALL_PLUGIN_FILE" "$PLUGIN_FOLDER_NAMES" "$PLUGIN_FILES_NEED_TO_EXTRACT"
+
+        # Extract all the plugin file that may contains information about plugin in its directory
+        if [ ! -d "$PLUGIN_EXTRACT_DIR" ]; then
+            echo "[INFO] Extracting plugin files from install archive..."
+            mkdir -p "$PLUGIN_EXTRACT_DIR.swap"
+            tar --overwrite -xf "$INSTALL_FILE" -C "${PLUGIN_EXTRACT_DIR}.swap" --files-from "$PLUGIN_FILES_NEED_TO_EXTRACT" && mv "${PLUGIN_EXTRACT_DIR}.swap" "$PLUGIN_EXTRACT_DIR"
+        fi
+
+        scan_plugin_folder "${PLUGIN_EXTRACT_DIR}/${ARCHIVE_FOLDER_ROOT}/plugins" "$PLUGIN_FOLDER_NAMES" "$PLUGIN_INFO_FILE"
+
+        if [ $REMOVE_TEMP_FILE -ne 0 ]; then
+            echo "[INFO] Removing temporary files..."
+            rm "$SYSTEMWIDE_JRE_FILES" "$ARCHIVE_JRE_FILES" "$ALL_PLUGIN_FILES" "$PLUGIN_FOLDER_NAMES" "$PLUGIN_FOLDER_NEED_TO_EXTRACT"
+        fi
+    fi
+
+    rm "$LOCK_FILE"
+}
+
+# Generate path list that might be a plugin file
+function filter_plugin_files()
+{
+    local PLUGIN_FOLDER="$1"
+    local ALL_PLUGIN_FILES="$2"
+    local PLUGIN_FOLDER_NAMES_OUT="$3"
+    local PLUGIN_FILES_OUT="$4"
+
+    if [ "${#*}" -ne 4 ]; then
+        echo "[ERROR] filter_plugin_foler: Require at least 4 argument" >&2
+        echo "        Usage:" >&2
+        echo "            filter_plugin_files <plugin_folder> <all_plugin_files> <plugin_folder_names_out> <plugin_files_out>" >&2
+        exit 1
+    fi
+
+    if [ -z "$PLUGIN_FOLDER" ]; then
+        echo "[ERROR] filter_plugin_folder: Plugin folder cannot be empty" >&2
+        exit 1
+    fi
+
+    if [ ! -f "$ALL_PLUGIN_FILES" ]; then
+        echo "[ERROR] filter_plugin_folder: All plugin list file ${ALL_PLUGIN_FILE} doesn't exist" >&2
+        exit 1
+    fi
+
+    if [ -z "$PLUGIN_FOLDER_NAMES_OUT" ]; then
+        echo "[ERROR] filter_plugin_folder: Plugin folder names out file cannot be empty" >&2
+        exit 1
+    fi
+
+    if [ -z "$PLUGIN_FILES_OUT" ]; then
+        echo "[ERROR] filter_plugin_folder: Plugin folder out file cannot be empty" >&2
+        exit 1
+    fi
+
+    local AWK_SCRIPT_PRINT_FOLDER_NAME_FROM_PLUGIN_PATH="{ \$0 = substr(\$0, ${#PLUGIN_FOLDER}); sub(/\/lib\/.*\$/, \"\", \$0); print \$0; }"
+    local AWK_SCRIPT_PRINT_PLUGIN_FILE_BY_FOLDER_NAME="{ print \"${PLUGIN_FOLDER}/\" \$0 \"/lib/\" \$0 \".jar\" }"
+
+    # Get all available plugin files
+    local PLUGIN_POSSIBLE_FOLDER_NAMES="${TEMP_DIR_BASE}/plugin-possible-folder-names.tmp"
+
+    awk "$AWK_SCRIPT_PRINT_FOLDER_NAME_FROM_PLUGIN_PATH" "$PLUGIN_FILES" | sort | uniq > "$PLUGIN_FOLDER_NAMES_OUT"
+
+    # Predict the most possible plugin files by using this pattern '<archive_root_dir>/plugins/<plugin_files>/lib/<plugin_file>.jar'
+    comm -12 "$ALL_PLUGIN_FILES" <(awk "$AWK_SCRIPT_PRINT_PLUGIN_FILE_BY_FOLDER_NAME" "$PLUGIN_FOLDER_NAMES_OUT" | sort) \
+| awk "$AWK_SCRIPT_PRINT_FOLDER_NAME_FROM_PLUGIN_PATH" \
+| sort > "$PLUGIN_POSSIBLE_FOLDER_NAMES"
+
+    # Filter the plugin folder that we can't predict by using previous method. Accumulate these plugin folders and predicted plugin files to a file
+    comm -23 "$PLUGIN_FOLDER_NAMES_OUT" "$PLUGIN_POSSIBLE_FOLDER_NAMES" | uniq | awk "{ print \"${PLUGIN_FOLDER}\" \$0 \"/\" }" > "$PLUGIN_FILES_OUT"
+    awk "$AWK_SCRIPT_PRINT_PLUGIN_FILE_BY_FOLDER_NAME" "$PLUGIN_POSSIBLE_FOLDER_NAMES" >> "$PLUGIN_FILES_OUT"
+
+    if [ $REMOVE_TEMP_FILE -ne 0 ]; then
+        rm "$PLUGIN_POSSIBLE_FOLDER_NAMES"
+    fi
+}
+
+function scan_plugin_folder()
+{
+    local PLUGIN_FOLDER="$1"
+    local PLUGIN_FOLDER_NAMES="$2"
+    local PLUGIN_FILES="$3"
+    local PLUGIN_INFO_FILE_OUT="$4"
+
+    if [[ ${#*} -ne 4 ]]; then
+        echo "[ERROR] scan_plugin_folder: Invalid usage" >&2
+        echo "        Usage:" >&2
+        echo "            scan_plugin_folder <plugin_folder> <plugin_files> <plugin_info_file_out>" >&2
+        exit 1
+    fi
+
+    if [ ! -d "$PLUGIN_FOLDER" ]; then
+        echo "[ERROR] scan_plugin_folder: The plugin folder doesn't exist: $PLUGIN_FOLDER" >&2
+        exit 1
+    fi
+
+    if [ ! -f "$PLUGIN_FILES" ]; then
+        echo "[ERROR] scan_plugin_folder: The plugin file name doesn't exist" >&2
+        exit 1
+    fi
+
+    if [ -z "$PLUGIN_INFO_FILE_OUT" ]; then
+        echo "[ERROR] scan_plugin_folder: The plugin file out cannot be empty" >&2
+        exit 1
+    fi
+
+    echo -n '' > "$PLUGIN_INFO_FILE_OUT"
+
+    local IFS_OLD="$IFS"
+    IFS=$'\n'
+
+    for plugin_folder_name in $(cat "$PLUGIN_FOLDER_NAMES")
+    do
+        local -i PLUGIN_ID_FOUND=0
+        local PLUGIN_ID
+
+        # TODO: This kind of loop is not really optimized, please change this asap
+        for plugin_file $(grep "${PLUGIN_FOLDER}/${plugin_folder_name}" "$PLUGIN_FILES")
+        do
+            PLUGIN_ID="$(unzip -lp "$plugin_file" 'META-INF/plugin.xml' | xmllint - -xpath 'idea-plugin/id/text()' 2> /dev/null)"
+            if [[ $? -eq 0 && -n "$PLUGIN_ID" ]]; then
+                PLUGIN_ID_FOUND=1
+                echo "$PLUGIN_ID,${plugin_folder_name}" >> "$PLUGIN_INFO_FILE_OUT"
+                break
+            fi
+        done
+
+        if [ $PLUGIN_ID_FOUND -eq 0 ]; then
+            echo "[WARN] No plugin file is found in folder ${plugin_folder_name}. You might want a deeper analysis" >&2
+        fi
+    done
+
+    IFS="$IFS_OLD"
+}
+
+function display_help()
+{
+	cat <<EOF
+JetBrains Rider install script
+
+Usage:
+    install <install_archive_file> [--only-install-plugin <plugin_id_list_file>]            Install application
+    plugin-info --install-location <dir> --out-file <out-file>                              Get plugin info about current installation
+    clear-cache                                                                             Remove the temporary folder completety (controlled by TEMP_DIR variable)
+    -h, --help, help                                                                        Show this message
+
+Environment variables:
+    JRE_DIR                                                                                 Java runtime directory (default is /usr/lib/jvm/java-21-openjdk-amd64)
+    DOTNET_DIR                                                                              .NET SDK directory (default is /usr/lib/dotnet/)
+    REMOVE_TEMP_FILE                                                                        Remove temporary files generated by initialization process, change value to 0 to disable this behaviour
+                                                                                            (default is 1)
+    TEMP_DIR                                                                                Directory for temporary files using by this script (default is /tmp/jetbrains-rider-installer)
+
+Made with love by dungleanh297
+EOF
+}
+
+function install()
+{
+    INSTALL_FILE="$1"
+    if [ -z "$INSTALL_FILE" ]; then
+        echo "[ERROR] Please provide JetBrain Rider install file" >&2
+        exit 1
+    fi
+
+    TEMP_DIR_BASE="${TEMP_DIR_PREFIX}/$(basename "$INSTALL_FILE")"
+
+    if [ ! -d "$TEMP_DIR_BASE" ]; then
+        mkdir -p "$TEMP_DIR_BASE"
+    fi
+}
+
+# Get all plugin info from specific installation directory
+function plugin_info()
+{
+    local INSTALL_DIR="$1"
+    local OUT_FILE="$2"
+
+    if [ ${#*} -ne 2 ]; then
+        echo "[ERROR] plugin_info requires 2 arguments" >&2
+        echo "        Usage:" >&2
+        echo "            plugin_info <install_dir> <out_file>" >&2
+        exit 1
+    fi
+
+    if [ ! -d "$INSTALL_DIR" ]; then
+        echo "[ERROR] Installation dir doesn't exist" >&2
+        exit 1
+    fi
+
+    if [ ! -f "$INSTALL_DIR/bin/rider" ]; then
+        echo "[ERROR] This looks like not a valid JetBrains Rider install location because it's missing Rider's executable file" >&2
+        exit 1
+    fi
+
+    if [ ! -d "$INSTALL_DIR/plugins" ]; then
+        echo "[ERROR] Cannot found plugin folder in install directory" >&2
+        exit 1
+    fi
+
+    if [ -z "$OUT_FILE" ]; then
+        echo "[ERROR] plugin_info: out_file cannot be an empty value" >&2
+        exit 1
+    fi
+
+    local TEMP_DIR_BASE="${TEMP_DIR_PREFIX}/current-installation/${INSTALL_DIR}"
+    local ALL_PLUGIN_FILES="${TEMP_DIR_BASE}/current-installation-all-plugin-files.tmp"
+    local PLUGIN_FILES="${TEMP_DIR_BASE}/current-installation-plugin-files.tmp"
+    local PLUGIN_FOLDER_NAMES=$"${TEMP_DIR_BASE}/current-installation-plugin-folder-names.tmp"
+
+    mkdir -p "$TEMP_DIR_BASE"
+
+    if [ $? -ne 0 ]; then
+        echo "[ERROR] plugin_info: Unable to create temporary folder at $TEMP_DIR_BASE" >&2
+        exit 1
+    fi
+
+    echo -n '' > "$OUT_FILE"
+    
+    echo "[INFO] plugin_info: Getting list of available plugin files..."   
+    find "${INSTALL_DIR}/plugins/" -mindepth 3 -maxdepth 3 -type f -iname '*.jar' -ipath "${INSTALL_DIR}/plugins/*/lib/*" | sort > "$ALL_PLUGIN_FILES"
+
+    filter_plugin_files "${INSTALL_DIR}/plugins/" "$ALL_PLUGIN_FILES" "$PLUGIN_FOLDER_NAMES" "$PLUGIN_FILES"
+    scan_plugin_folder "${INSTALL_DIR}/plugins/" "$PLUGIN_FOLDER_NAMES" "$PLUGIN_FOLDER_NAMES" "$PLUGIN_FILES" "$PLUGIN_INFO_FILE_OUT"
+
+    if [ $REMOVE_TEMP_FILE -ne 0 ]; then
+        echo "[INFO] Clearing cache files..."
+        rm "$ALL_PLUGIN_FILES" "$CURRENT_INSTALLATION_PLUGIN_FOLDER_NAMES" "$POSSIBLE_PLUGIN_FILES"
+    fi
+}
+
+function validate_temp_dir()
+{
+    if [[ -z "$TEMP_DIR_PREFIX" || "$TEMP_DIR_PREFIX" -ef "/" ]]; then
+        echo "[ERROR]: TEMP_DIR_PREFIX variable is empty or pointing to the root folder. Unable to clear the cache folder"
+        exit 1
+    fi
+}
+
+function clear_cache()
+{
+    validate_temp_dir
+    rm -rf "$TEMP_DIR_PREFIX"
+}
+
+check_dependencies
+
+CHOICE="$1"
+shift 1
+
+case "$CHOICE"
+in
+    "--help" | "-h" | "help") 
+        display_help
+
+    ;;
+
+    "install")
+        echo "Install command"
+    ;;
+
+    "plugin-info")
+        INSTALL_LOCATION=''
+        OUT_FILE=''
+
+        while [ ${#*} -ne 0 ]
+        do
+            ARG="$1"
+            shift 1
+
+            if [ ${#*} -eq 0 ]; then
+                echo "Missing argument value: $ARG" >&2
+                exit 1
+            fi
+
+            case "$ARG"
+            in
+                "--install-location")
+                    INSTALL_LOCATION="$1"
+                ;;
+
+                "--out-file")
+                    OUT_FILE="$1"
+                ;;
+
+                *)
+                    echo "Unrecognizable option: $ARG" >&2
+                    exit 1
+                ;;
+            esac
+
+            shift 1
+        done
+        plugin_info "$INSTALL_LOCATION" "$OUT_FILE"
+    ;;
+
+    "clear-cache")
+        clear_cache
+    ;;
+
+    *)
+        echo "Unknown option: $CHOICE" >&2
+        display_help
+    ;;
+esac
